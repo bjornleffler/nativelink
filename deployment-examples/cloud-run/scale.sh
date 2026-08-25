@@ -16,7 +16,9 @@ REGION="${REGION:-us-central1}"
 CAS_POOL="${CAS_POOL:-nativelink-cas}"
 SCHED_POOL="${SCHED_POOL:-nativelink-scheduler}"
 WORKER_POOL="${WORKER_POOL:-nativelink-worker-x86}"
+CC_WORKER_POOL="${CC_WORKER_POOL:-nativelink-worker-lre-cc}"
 VM="${VM:-nl-test-client}"
+PROXY_VM="${PROXY_VM:-nl-proxy}"
 ZONE="${ZONE:-${REGION}-a}"
 
 action="${1:-status}"
@@ -33,18 +35,24 @@ scale_pool() {
 case "${action}" in
   down)
     echo "==> Scaling everything to zero"
+    scale_pool "${CC_WORKER_POOL}" 0
     scale_pool "${WORKER_POOL}" 0
     scale_pool "${SCHED_POOL}" 0
     scale_pool "${CAS_POOL}" 0
-    echo "==> Stopping the test VM"
-    gcloud compute instances stop "${VM}" --zone="${ZONE}" --project="${PROJECT}" --quiet 2>/dev/null \
-      || echo "    (vm not found or already stopped)"
+    echo "==> Stopping VMs"
+    for vm in "${VM}" "${PROXY_VM}"; do
+      echo "  ${vm}"
+      gcloud compute instances stop "${vm}" --zone="${ZONE}" --project="${PROJECT}" --quiet 2>/dev/null \
+        || echo "    (not found or already stopped)"
+    done
     echo
     echo "Stopped. Note that these still cost a little even at zero:"
     echo "  - Cloud NAT gateway (hourly, whether used or not)"
     echo "  - GCS storage for whatever is in the CAS bucket"
     echo "  - Artifact Registry image storage"
-    echo "  - the stopped VM's persistent disk"
+    echo "  - the stopped VMs' persistent disks"
+    echo "  - the proxy's reserved static IP (charged while NOT attached to"
+    echo "    a running instance, so stopping the VM slightly increases it)"
     echo "Delete the NAT too if you will not be back for a while:"
     echo "  gcloud compute routers nats delete nl-vpc-nat --router=nl-vpc-router --region=${REGION}"
     ;;
@@ -55,9 +63,13 @@ case "${action}" in
     scale_pool "${CAS_POOL}" 1
     scale_pool "${SCHED_POOL}" 1
     scale_pool "${WORKER_POOL}" 1
-    echo "==> Starting the test VM"
-    gcloud compute instances start "${VM}" --zone="${ZONE}" --project="${PROJECT}" --quiet 2>/dev/null \
-      || echo "    (vm not found)"
+    scale_pool "${CC_WORKER_POOL}" 1
+    echo "==> Starting VMs"
+    for vm in "${VM}" "${PROXY_VM}"; do
+      echo "  ${vm}"
+      gcloud compute instances start "${vm}" --zone="${ZONE}" --project="${PROJECT}" --quiet 2>/dev/null \
+        || echo "    (not found)"
+    done
     echo
     echo "Give the sidecars ~60s to republish DNS - instance IPs change on"
     echo "restart, so workers will log resolve failures until they do."
