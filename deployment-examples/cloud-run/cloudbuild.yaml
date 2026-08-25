@@ -5,6 +5,8 @@
 # Docker VM). Cloud Build runs in the same network as Artifact Registry, so
 # only a few KB of build context leaves the machine. It also builds natively
 # on amd64, so no cross-platform emulation is needed.
+timeout: 1800s
+
 substitutions:
   _NATIVELINK_VERSION: v1.6.6
   _REGION: us-central1
@@ -32,6 +34,19 @@ steps:
       - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dns-register:latest
       - ./dns-register
 
+  # C++ worker: LRE clang toolchain + nativelink binary.
+  - name: gcr.io/cloud-builders/docker
+    id: worker-lre-cc
+    args:
+      - build
+      - --build-arg=NATIVELINK_VERSION=${_NATIVELINK_VERSION}
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/worker-lre-cc:${_NATIVELINK_VERSION}
+      - -f
+      - Dockerfile.worker-lre-cc
+      - .
+
 images:
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/nativelink:${_NATIVELINK_VERSION}
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dns-register:latest
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/worker-lre-cc:${_NATIVELINK_VERSION}

@@ -18,51 +18,33 @@
       name: "CAS_MAIN_STORE",
       verify: {
         backend: {
-          dedup: {
-            index_store: {
-              fast_slow: {
-                fast: {
-                  filesystem: {
-                    content_path: "/tmp/nativelink/content-index",
-                    temp_path: "/tmp/nativelink/tmp-index",
-                    eviction_policy: {
-                      max_bytes: "${NL_INDEX_CACHE_BYTES:-500000000}",
-                    },
-                  },
-                },
-                slow: {
-                  experimental_cloud_object_store: {
-                    provider: "gcs",
-                    bucket: "${NL_GCS_BUCKET}",
-                    key_prefix: "cas-index/",
-                    retry: {
-                      max_retries: 6,
-                      delay: 0.3,
-                      jitter: 0.5,
-                    },
-                    multipart_max_concurrent_uploads: 10,
-                    // Defaults to false, which silently falls back to
-                    // anonymous access when credentials are missing - a
-                    // private bucket then fails with confusing 403s at
-                    // request time. Fail fast at startup instead.
-                    authentication_required: true,
-                  },
-                },
-              },
-            },
-            content_store: {
+          // SIZE PARTITIONING IS REQUIRED, NOT AN OPTIMISATION.
+          //
+          // The dedup store cannot store zero-byte blobs - it fails with
+          // "Zero byte hash not empty : Failed to insert our index entry to
+          // index_store in dedup_store". Remote execution uploads the stdout
+          // and stderr of every action, and a successful compile produces
+          // empty stdout, so routing everything through dedup breaks remote
+          // execution for essentially every action. Pure caching never hits
+          // this, which is why it only appears once execution is enabled.
+          //
+          // Small blobs bypass dedup. That is also the right thing on the
+          // merits: chunking overhead exceeds any saving below a few tens of
+          // kilobytes, and the config schema notes dedup "pairs well with
+          // SizePartitioning".
+          size_partitioning: {
+            size: "${NL_DEDUP_THRESHOLD:-64kb}",
+            lower_store: {
               compression: {
-                compression_algorithm: {
-                  lz4: {},
-                },
+                compression_algorithm: { lz4: {} },
                 backend: {
                   fast_slow: {
                     fast: {
                       filesystem: {
-                        content_path: "/tmp/nativelink/content-cas",
-                        temp_path: "/tmp/nativelink/tmp-cas",
+                        content_path: "/tmp/nativelink/content-small",
+                        temp_path: "/tmp/nativelink/tmp-small",
                         eviction_policy: {
-                          max_bytes: "${NL_CAS_CACHE_BYTES:-2000000000}",
+                          max_bytes: "${NL_SMALL_CACHE_BYTES:-100000000}",
                         },
                       },
                     },
@@ -70,14 +52,65 @@
                       experimental_cloud_object_store: {
                         provider: "gcs",
                         bucket: "${NL_GCS_BUCKET}",
-                        key_prefix: "cas-content/",
-                        retry: {
-                          max_retries: 6,
-                          delay: 0.3,
-                          jitter: 0.5,
-                        },
+                        key_prefix: "cas-small/",
+                        retry: { max_retries: 6, delay: 0.3, jitter: 0.5 },
                         multipart_max_concurrent_uploads: 10,
                         authentication_required: true,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            upper_store: {
+              dedup: {
+                index_store: {
+                  fast_slow: {
+                    fast: {
+                      filesystem: {
+                        content_path: "/tmp/nativelink/content-index",
+                        temp_path: "/tmp/nativelink/tmp-index",
+                        eviction_policy: {
+                          max_bytes: "${NL_INDEX_CACHE_BYTES:-100000000}",
+                        },
+                      },
+                    },
+                    slow: {
+                      experimental_cloud_object_store: {
+                        provider: "gcs",
+                        bucket: "${NL_GCS_BUCKET}",
+                        key_prefix: "cas-index/",
+                        retry: { max_retries: 6, delay: 0.3, jitter: 0.5 },
+                        multipart_max_concurrent_uploads: 10,
+                        authentication_required: true,
+                      },
+                    },
+                  },
+                },
+                content_store: {
+                  compression: {
+                    compression_algorithm: { lz4: {} },
+                    backend: {
+                      fast_slow: {
+                        fast: {
+                          filesystem: {
+                            content_path: "/tmp/nativelink/content-cas",
+                            temp_path: "/tmp/nativelink/tmp-cas",
+                            eviction_policy: {
+                              max_bytes: "${NL_CAS_CACHE_BYTES:-300000000}",
+                            },
+                          },
+                        },
+                        slow: {
+                          experimental_cloud_object_store: {
+                            provider: "gcs",
+                            bucket: "${NL_GCS_BUCKET}",
+                            key_prefix: "cas-content/",
+                            retry: { max_retries: 6, delay: 0.3, jitter: 0.5 },
+                            multipart_max_concurrent_uploads: 10,
+                            authentication_required: true,
+                          },
+                        },
                       },
                     },
                   },
@@ -97,7 +130,7 @@
             content_path: "/tmp/nativelink/content-ac",
             temp_path: "/tmp/nativelink/tmp-ac",
             eviction_policy: {
-              max_bytes: "${NL_AC_CACHE_BYTES:-500000000}",
+              max_bytes: "${NL_AC_CACHE_BYTES:-100000000}",
             },
           },
         },
@@ -106,11 +139,7 @@
             provider: "gcs",
             bucket: "${NL_GCS_BUCKET}",
             key_prefix: "ac/",
-            retry: {
-              max_retries: 6,
-              delay: 0.3,
-              jitter: 0.5,
-            },
+            retry: { max_retries: 6, delay: 0.3, jitter: 0.5 },
             multipart_max_concurrent_uploads: 10,
             authentication_required: true,
           },

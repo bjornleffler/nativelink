@@ -1,0 +1,31 @@
+# NativeLink C++ worker for Cloud Run: upstream's LRE clang toolchain plus the
+# nativelink binary, CA certificates and the worker config.
+#
+# WHY THIS IMAGE EXISTS:
+# ghcr.io/tracemachina/nativelink-worker-lre-cc ships the clang toolchain only
+# - no nativelink binary, no entrypoint, no CA bundle. Upstream's Kubernetes
+# setup injects the binary at pod start via a `nativelink-worker-init`
+# initContainer writing into a shared volume. Cloud Run worker pools support
+# sidecars but that indirection buys nothing here, so the binary is baked in.
+ARG NATIVELINK_VERSION=v1.6.6
+
+FROM alpine:3.20 AS certs
+RUN apk add --no-cache ca-certificates
+
+# The nativelink image has no shell, so /bin/nativelink cannot be dereferenced
+# in place - it is a symlink into /nix/store. Copy the whole rootfs into a
+# stage that does have a shell and resolve it there. Avoids hardcoding the
+# store hash, which changes with every release.
+FROM ghcr.io/tracemachina/nativelink:${NATIVELINK_VERSION} AS nlimage
+FROM alpine:3.20 AS extract
+COPY --from=nlimage / /src
+# /src/bin/nativelink is an ABSOLUTE symlink into /nix/store, so it dangles
+# once copied into this stage. Resolve the real file in the store directly.
+RUN cp /src/nix/store/*-nativelink-*/bin/nativelink /nativelink && chmod +x /nativelink
+
+FROM ghcr.io/tracemachina/nativelink-worker-lre-cc:${NATIVELINK_VERSION}
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=extract /nativelink /bin/nativelink
+COPY config/worker.json5 /etc/nativelink/worker.json5
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENTRYPOINT ["/bin/nativelink"]
