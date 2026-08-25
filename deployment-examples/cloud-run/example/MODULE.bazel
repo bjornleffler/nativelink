@@ -1,0 +1,17 @@
+# Minimal workspace for verifying NativeLink remote execution.
+module(name = "nativelink_rbe_example", version = "0.0.1")
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.20")
+
+# Hermetic LLVM toolchain. This is what makes remote execution work without
+# the worker needing a compiler at a path matching your machine's: the
+# toolchain is shipped to the worker as action inputs.
+bazel_dep(name = "llvm", version = "0.8.15")
+
+# REQUIRED. Without this, the --platforms flags below still resolve your
+# host's autodetected compiler, and Bazel sends something like /usr/bin/gcc to
+# a worker that does not have it. The action then fails on the worker with
+# "Could not canonicalize path for command root /usr/bin/gcc" - which looks
+# like a NativeLink problem but is purely client-side toolchain resolution.
+register_toolchains("@llvm//toolchain:all")

@@ -1,0 +1,27 @@
+# Remote execution against the NativeLink Cloud Run deployment.
+#
+# Platform flags mirror nativelink's own ci.bazelrc `nl-rbe` config. All three
+# are needed - setting only --platforms leaves host tools in play.
+common:rbe --platforms=@llvm//platforms:linux_x86_64_gnu.2.28
+common:rbe --host_platform=@llvm//platforms:linux_x86_64_gnu.2.28
+common:rbe --extra_execution_platforms=@llvm//platforms:linux_x86_64_gnu.2.28
+
+common:rbe --remote_instance_name=main
+common:rbe --remote_timeout=600
+common:rbe --remote_retries=8
+common:rbe --jobs=50
+
+# Through the public proxy. Reachable only from allowlisted source IPs.
+# PLAINTEXT: no TLS, so build inputs and outputs cross the internet in the
+# clear and an on-path attacker could tamper with cached artifacts. Prototype
+# use with throwaway code only.
+common:proxy --config=rbe
+common:proxy --remote_cache=grpc://34.63.47.117:8980
+common:proxy --remote_executor=grpc://34.63.47.117:8981
+
+# From inside the VPC, addressing the pools by their internal DNS names.
+common:internal --config=rbe
+common:internal --remote_cache=grpc://nativelink-cas.nl.internal:8080
+common:internal --remote_executor=grpc://nativelink-scheduler.nl.internal:8080
+
+build --verbose_failures
