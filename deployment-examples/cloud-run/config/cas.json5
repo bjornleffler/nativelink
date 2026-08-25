@@ -1,0 +1,166 @@
+// NativeLink CAS for Cloud Run - separate pool from the scheduler.
+//
+// WHY SPLIT FROM THE SCHEDULER:
+// The scheduler holds queue state in memory and is therefore pinned to a
+// single instance. When CAS shared its pool, that constraint silently capped
+// CAS throughput too, and a heavy blob upload competed for CPU with the one
+// component coordinating the entire farm. Splitting removes both problems and
+// lets each side be sized and redeployed independently.
+//
+// DELIBERATELY ONE INSTANCE:
+// The `filesystem` fast tier below is local to the instance and NativeLink has
+// no cross-instance coordination for it. Running N instances would mean N
+// independent caches, lowering hit rate and raising GCS reads. Scale past one
+// only alongside a shared fast tier (Redis).
+{
+  stores: [
+    {
+      name: "CAS_MAIN_STORE",
+      verify: {
+        backend: {
+          dedup: {
+            index_store: {
+              fast_slow: {
+                fast: {
+                  filesystem: {
+                    content_path: "/tmp/nativelink/content-index",
+                    temp_path: "/tmp/nativelink/tmp-index",
+                    eviction_policy: {
+                      max_bytes: "${NL_INDEX_CACHE_BYTES:-500000000}",
+                    },
+                  },
+                },
+                slow: {
+                  experimental_cloud_object_store: {
+                    provider: "gcs",
+                    bucket: "${NL_GCS_BUCKET}",
+                    key_prefix: "cas-index/",
+                    retry: {
+                      max_retries: 6,
+                      delay: 0.3,
+                      jitter: 0.5,
+                    },
+                    multipart_max_concurrent_uploads: 10,
+                    // Defaults to false, which silently falls back to
+                    // anonymous access when credentials are missing - a
+                    // private bucket then fails with confusing 403s at
+                    // request time. Fail fast at startup instead.
+                    authentication_required: true,
+                  },
+                },
+              },
+            },
+            content_store: {
+              compression: {
+                compression_algorithm: {
+                  lz4: {},
+                },
+                backend: {
+                  fast_slow: {
+                    fast: {
+                      filesystem: {
+                        content_path: "/tmp/nativelink/content-cas",
+                        temp_path: "/tmp/nativelink/tmp-cas",
+                        eviction_policy: {
+                          max_bytes: "${NL_CAS_CACHE_BYTES:-2000000000}",
+                        },
+                      },
+                    },
+                    slow: {
+                      experimental_cloud_object_store: {
+                        provider: "gcs",
+                        bucket: "${NL_GCS_BUCKET}",
+                        key_prefix: "cas-content/",
+                        retry: {
+                          max_retries: 6,
+                          delay: 0.3,
+                          jitter: 0.5,
+                        },
+                        multipart_max_concurrent_uploads: 10,
+                        authentication_required: true,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        verify_size: true,
+      },
+    },
+    {
+      name: "AC_MAIN_STORE",
+      fast_slow: {
+        fast: {
+          filesystem: {
+            content_path: "/tmp/nativelink/content-ac",
+            temp_path: "/tmp/nativelink/tmp-ac",
+            eviction_policy: {
+              max_bytes: "${NL_AC_CACHE_BYTES:-500000000}",
+            },
+          },
+        },
+        slow: {
+          experimental_cloud_object_store: {
+            provider: "gcs",
+            bucket: "${NL_GCS_BUCKET}",
+            key_prefix: "ac/",
+            retry: {
+              max_retries: 6,
+              delay: 0.3,
+              jitter: 0.5,
+            },
+            multipart_max_concurrent_uploads: 10,
+            authentication_required: true,
+          },
+        },
+      },
+    },
+  ],
+  servers: [
+    {
+      listener: {
+        http: {
+          socket_address: "0.0.0.0:${PORT:-8080}",
+        },
+      },
+      services: {
+        cas: [
+          {
+            instance_name: "main",
+            cas_store: "CAS_MAIN_STORE",
+          },
+        ],
+        ac: [
+          {
+            instance_name: "main",
+            ac_store: "AC_MAIN_STORE",
+          },
+        ],
+        bytestream: [
+          {
+            instance_name: "main",
+            cas_store: "CAS_MAIN_STORE",
+          },
+        ],
+        // REQUIRED even though this pool does no execution. Bazel calls
+        // GetCapabilities on every endpoint it talks to, including a
+        // cache-only one, before issuing any other RPC. Without this the very
+        // first build fails with:
+        //   UNIMPLEMENTED ... No route for
+        //   .../build.bazel.remote.execution.v2.Capabilities/GetCapabilities
+        //
+        // `remote_execution` is deliberately omitted: that tells clients this
+        // endpoint serves cache only, which is exactly true. Remote execution
+        // capabilities are advertised by the scheduler pool instead.
+        capabilities: [
+          {
+            instance_name: "main",
+          },
+        ],
+        health: {},
+      },
+    },
+  ],
+}

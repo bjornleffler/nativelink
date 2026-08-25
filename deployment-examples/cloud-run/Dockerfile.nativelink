@@ -1,0 +1,30 @@
+# NativeLink for Cloud Run, with CA certificates added.
+#
+# WHY THIS IMAGE EXISTS:
+# The published ghcr.io/tracemachina/nativelink image is a static musl binary
+# in /nix/store with an almost empty root filesystem - it ships no CA
+# certificate bundle. Any outbound TLS connection fails with:
+#   "No CA certificates were loaded from the system"
+# which makes the GCS-backed CAS impossible. Verified against v1.6.6 by
+# exporting the image filesystem: there is no /etc/ssl anywhere in it.
+#
+# This layers a standard CA bundle on top of the upstream image and changes
+# nothing else.
+ARG NATIVELINK_VERSION=v1.6.6
+FROM alpine:3.20 AS certs
+RUN apk add --no-cache ca-certificates
+
+FROM ghcr.io/tracemachina/nativelink:${NATIVELINK_VERSION}
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# Configs are baked in rather than mounted from Secret Manager, because
+# "Secrets volume mount is not supported for Worker Pools yet" (verified
+# against gcloud 580). They contain no secrets - bucket name, ports and cache
+# sizes are all supplied by environment variables at deploy time - so the same
+# image is reusable across environments.
+COPY config/cas.json5 /etc/nativelink/cas.json5
+COPY config/scheduler.json5 /etc/nativelink/scheduler.json5
+COPY config/worker.json5 /etc/nativelink/worker.json5
+# Belt and braces: some TLS stacks consult SSL_CERT_FILE before probing paths.
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENTRYPOINT ["/bin/nativelink"]

@@ -1,0 +1,106 @@
+// NativeLink scheduler for Cloud Run - separate pool from the CAS.
+//
+// Holds queue state in memory, so this pool MUST stay at --instances=1.
+// That constraint is why the CAS was split out: it no longer inherits it.
+//
+// PORT SPLIT - upstream's intended permission separation:
+// nativelink-config/src/cas_server.rs states that `worker_api` must not share
+// a port with client-facing services, because anyone reaching the worker API
+// can register as a worker, claim actions, and return forged results,
+// poisoning the action cache. Cloud Run worker pools attached to a VPC subnet
+// get a real NIC, so multiple ports are reachable and the split is possible -
+// verified empirically, see ../spike/README.md. Firewall rules enforce it:
+// only the worker subnet may reach NL_WORKER_API_PORT.
+{
+  stores: [
+    {
+      // The scheduler does not own storage; it reads action and command protos
+      // from the CAS pool over gRPC.
+      name: "GRPC_CAS_STORE",
+      grpc: {
+        instance_name: "main",
+        endpoints: [
+          {
+            address: "grpc://${NL_CAS_ENDPOINT}",
+          },
+        ],
+        store_type: "cas",
+      },
+    },
+    {
+      name: "GRPC_AC_STORE",
+      grpc: {
+        instance_name: "main",
+        endpoints: [
+          {
+            address: "grpc://${NL_CAS_ENDPOINT}",
+          },
+        ],
+        store_type: "ac",
+      },
+    },
+  ],
+  schedulers: [
+    {
+      name: "MAIN_SCHEDULER",
+      simple: {
+        // Must cover every property the workers advertise and every property
+        // Bazel sends in exec_properties, or actions never match a worker.
+        supported_platform_properties: {
+          cpu_count: "minimum",
+          memory_kb: "minimum",
+          network_kbps: "minimum",
+          cpu_arch: "exact",
+          OSFamily: "priority",
+          "container-image": "priority",
+          "lre-rs": "priority",
+          ISA: "exact",
+        },
+        // Cloud Run recycles instances; give a disconnected worker room to
+        // reconnect before its actions are re-queued elsewhere.
+        worker_timeout_s: 120,
+      },
+    },
+  ],
+  servers: [
+    {
+      // Client-facing frontend.
+      listener: {
+        http: {
+          socket_address: "0.0.0.0:${PORT:-8080}",
+        },
+      },
+      services: {
+        execution: [
+          {
+            instance_name: "main",
+            cas_store: "GRPC_CAS_STORE",
+            scheduler: "MAIN_SCHEDULER",
+          },
+        ],
+        capabilities: [
+          {
+            instance_name: "main",
+            remote_execution: {
+              scheduler: "MAIN_SCHEDULER",
+            },
+          },
+        ],
+      },
+    },
+    {
+      // Backend API. Worker subnet only - see the note at the top.
+      listener: {
+        http: {
+          socket_address: "0.0.0.0:${NL_WORKER_API_PORT:-50061}",
+        },
+      },
+      services: {
+        worker_api: {
+          scheduler: "MAIN_SCHEDULER",
+        },
+        health: {},
+      },
+    },
+  ],
+}

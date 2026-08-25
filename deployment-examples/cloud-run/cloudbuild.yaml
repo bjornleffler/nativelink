@@ -1,0 +1,37 @@
+# Builds both NativeLink images inside GCP rather than on a developer laptop.
+#
+# WHY: pushing image layers from a local Docker daemon to Artifact Registry
+# proved unreliable on a slow/flaky link (broken pipes, DNS failures in the
+# Docker VM). Cloud Build runs in the same network as Artifact Registry, so
+# only a few KB of build context leaves the machine. It also builds natively
+# on amd64, so no cross-platform emulation is needed.
+substitutions:
+  _NATIVELINK_VERSION: v1.6.6
+  _REGION: us-central1
+  _REPO: nativelink
+
+steps:
+  # The NativeLink binary plus a CA bundle, which the upstream image lacks.
+  - name: gcr.io/cloud-builders/docker
+    id: nativelink
+    args:
+      - build
+      - --build-arg=NATIVELINK_VERSION=${_NATIVELINK_VERSION}
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/nativelink:${_NATIVELINK_VERSION}
+      - -f
+      - Dockerfile.nativelink
+      - .
+
+  # The Cloud DNS registration sidecar.
+  - name: gcr.io/cloud-builders/docker
+    id: dns-register
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dns-register:latest
+      - ./dns-register
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/nativelink:${_NATIVELINK_VERSION}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dns-register:latest
