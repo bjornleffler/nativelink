@@ -11,6 +11,7 @@ substitutions:
   _NATIVELINK_VERSION: v1.6.6
   _REGION: us-central1
   _REPO: nativelink
+  _OTEL_COLLECTOR_VERSION: 0.159.0
 
 steps:
   # The NativeLink binary plus a CA bundle, which the upstream image lacks.
@@ -34,6 +35,20 @@ steps:
       - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dns-register:latest
       - ./dns-register
 
+  # OTLP -> Cloud Monitoring bridge, a sidecar on the scheduler pool. Without
+  # it the scheduler's queue-depth metric never leaves the instance and CREMA
+  # has nothing to scale on.
+  - name: gcr.io/cloud-builders/docker
+    id: otel-collector
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/otel-collector:${_OTEL_COLLECTOR_VERSION}
+      - --build-arg=OTEL_COLLECTOR_VERSION=${_OTEL_COLLECTOR_VERSION}
+      - -f
+      - Dockerfile.otel-collector
+      - .
+
   # C++ worker: LRE clang toolchain + nativelink binary.
   - name: gcr.io/cloud-builders/docker
     id: worker-lre-cc
@@ -50,3 +65,4 @@ images:
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/nativelink:${_NATIVELINK_VERSION}
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/dns-register:latest
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/worker-lre-cc:${_NATIVELINK_VERSION}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/otel-collector:${_OTEL_COLLECTOR_VERSION}

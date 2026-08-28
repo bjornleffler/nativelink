@@ -1,0 +1,111 @@
+# OpenTelemetry Collector sidecar for the NativeLink scheduler pool.
+#
+# WHY THIS EXISTS: NativeLink emits OTLP and nothing else - it has no
+# Prometheus scrape endpoint at all (see ../../metrics/README.md). CREMA's
+# prometheus scaler reads Cloud Monitoring. This sidecar is the only bridge
+# between the two, and it is the whole of the change on the NativeLink side:
+# init_tracing() builds the OTLP metric exporter unconditionally over gRPC and
+# defaults to localhost:4317 (nativelink-util/src/telemetry.rs), so the
+# scheduler is ALREADY exporting these metrics into a socket that nothing is
+# listening on. No NativeLink config or code change is required.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        # localhost, NOT 0.0.0.0. Containers in a Cloud Run instance share a
+        # network namespace, so the scheduler reaches us over loopback.
+        # Binding the subnet NIC would publish an unauthenticated OTLP ingest
+        # port to the whole VPC - the same class of mistake the worker-API
+        # port split in ../config/scheduler.json5 exists to avoid.
+        endpoint: localhost:4317
+
+processors:
+  # KEEP THIS FIRST AND KEEP IT STRICT - THIS IS A BILLING CONTROL.
+  #
+  # NativeLink attaches execution.action_digest as an attribute on
+  # execution.completed.count (nativelink-scheduler/src/memory_awaited_action_db.rs).
+  # That is one distinct label value per action executed, so exporting the
+  # full metric set would create an unbounded number of Cloud Monitoring
+  # custom metric series and bill for every one of them, forever.
+  #
+  # Autoscaling needs exactly one metric. execution.active.count carries a
+  # single bounded attribute (execution.stage, five possible values), so the
+  # whole export is at most five series.
+  #
+  # Conditions here are DROP conditions: anything matching is discarded.
+  filter/autoscaling_only:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'name != "execution.active.count"'
+
+  # Fills in project and region from the Cloud Run metadata server.
+  resource_detection:
+    detectors: [env, gcp]
+    timeout: 10s
+    override: false
+
+  # PIN THE SERIES IDENTITY.
+  #
+  # NativeLink stamps service.instance.id with a fresh UUIDv4 on every process
+  # start (nativelink-util/src/telemetry.rs). Left alone, every scheduler
+  # restart mints a brand new Cloud Monitoring time series, and for the length
+  # of the PromQL lookback window an instant query would see BOTH the old
+  # series and the new one and sum them - CREMA would then scale on a doubled
+  # queue depth immediately after every redeploy.
+  #
+  # Overwriting it with a constant is correct here ONLY because the scheduler
+  # pool is pinned to a single instance for unrelated reasons (queue state is
+  # in memory - see ../config/scheduler.json5). Do not copy this processor
+  # into a pool that runs more than one instance: the series would collide.
+  resource/stable_identity:
+    attributes:
+      - key: service.instance.id
+        value: nativelink-scheduler
+        action: upsert
+      - key: service.name
+        value: nativelink-scheduler
+        action: upsert
+      - key: service.namespace
+        value: nativelink
+        action: upsert
+
+  # Cloud Monitoring rejects two points written to the same series less than
+  # 5s apart. Batching well above that also keeps the write API call count -
+  # and therefore the bill - low. 60s is far finer than the 2+ minute
+  # ingestion delay downstream, so it is not the limiting factor in scaling
+  # latency.
+  batch:
+    timeout: 60s
+    send_batch_size: 1024
+
+exporters:
+  googlecloud:
+    # Project is taken from the metadata server via resource_detection.
+    metric:
+      # Explicit even though it is the default: the PromQL query in
+      # ../crema/config.yaml.tmpl hard-codes the mangled form of this prefix
+      # (workload_googleapis_com:execution_active_count), so the two must be
+      # changed together.
+      prefix: workload.googleapis.com
+
+  # Uncomment and add to the pipeline below during Phase 0 verification to see
+  # exactly which metrics and attributes are leaving the collector. Leave it
+  # out in steady state - it prints every batch to the pool's logs.
+  # debug:
+  #   verbosity: detailed
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors:
+        - filter/autoscaling_only
+        - resource_detection
+        - resource/stable_identity
+        - batch
+      exporters: [googlecloud]
+  telemetry:
+    logs:
+      level: info

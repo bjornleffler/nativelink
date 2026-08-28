@@ -1,0 +1,124 @@
+# CREMA (Cloud Run External Metrics Autoscaling) configuration for the
+# NativeLink worker fleet. Rendered by ../deploy-crema.sh and stored in
+# Parameter Manager - CREMA reads it from there, not from a file.
+#
+# Placeholders are substituted by deploy-crema.sh: __PROJECT__, __REGION__,
+# __WORKER_POOL__, __MAX_WORKERS__, __ACTIONS_PER_WORKER__.
+apiVersion: crema/v1
+kind: CremaConfig
+metadata:
+  name: nativelink-workers
+spec:
+  # NO pollingInterval, DELIBERATELY.
+  #
+  # With pollingInterval set, CREMA re-invokes itself in a loop and must be
+  # deployed --no-cpu-throttling, which means a Java Cloud Run service billed
+  # around the clock. At this deployment's scale that plausibly costs more
+  # than the single worker instance the autoscaler exists to park - the same
+  # class of always-on cost ../scale.sh tears down between sessions.
+  #
+  # Omitting it makes CREMA evaluate only on POST. deploy-crema.sh drives it
+  # from Cloud Scheduler instead, so the service scales to zero between ticks.
+  # See ../AUTOSCALING.md for the cost arithmetic.
+
+  triggerAuthentications:
+    - metadata:
+        name: gcp-auth
+      spec:
+        # The attached service account's own token. No secrets to manage,
+        # which is why the Prometheus/Cloud Monitoring route was chosen over a
+        # scaler that needs a stored credential.
+        podIdentity:
+          provider: gcp
+
+  scaledObjects:
+    - spec:
+        # VERIFY THE CASE OF "workerPools" ON FIRST DEPLOY. Google's own docs
+        # disagree with themselves: the CREMA guide writes ".../workerpools/..."
+        # and the Prometheus tutorial writes ".../workerPools/...". A wrong
+        # value here fails as a not-found on the scale target, visible in the
+        # CREMA service logs.
+        scaleTargetRef:
+          name: projects/__PROJECT__/locations/__REGION__/workerPools/__WORKER_POOL__
+
+        # Zero is the point of the exercise: worker pools do not scale to zero
+        # on their own and bill at full rate while idle.
+        minReplicaCount: 0
+        maxReplicaCount: __MAX_WORKERS__
+
+        triggers:
+          - type: prometheus
+            name: nativelink-action-queue
+            metadata:
+              # Cloud Monitoring's PromQL endpoint, not a Prometheus server.
+              serverAddress: https://monitoring.googleapis.com/v1/projects/__PROJECT__/location/global/prometheus
+
+              # KEDA computes ceil(query_result / threshold), so this is
+              # "actions one worker can run at once" - keep it equal to the
+              # worker pool's --cpu, which is what config/worker.json5
+              # advertises as cpu_count.
+              threshold: "__ACTIONS_PER_WORKER__"
+
+              # Below this the pool is allowed to go to zero.
+              activationThreshold: "0"
+
+              # An empty result means "no actions anywhere", not an error.
+              # Without this the scaler errors out whenever the farm is idle -
+              # which is exactly when it needs to report zero.
+              ignoreNullValues: "true"
+
+              # QUEUED **AND** EXECUTING, DELIBERATELY.
+              #
+              # Scaling on queue depth alone is the documented CREMA failure
+              # mode (GoogleCloudPlatform/cloud-run-external-metrics-autoscaling
+              # issue #6): the moment workers claim the work the queue reads
+              # zero, CREMA recommends zero instances, and Cloud Run SIGTERMs
+              # the instances with roughly ten seconds of grace. NativeLink
+              # workers do handle SIGTERM and the scheduler re-queues orphaned
+              # actions after worker_timeout_s, so a build does not fail - but
+              # every killed action is re-run from scratch.
+              #
+              # Counting executing actions keeps a worker alive while it is
+              # doing work. The metric name is the Cloud Monitoring PromQL
+              # mangling of workload.googleapis.com/execution.active.count:
+              # first "/" becomes ":", every other special character becomes
+              # "_".
+              #
+              # monitored_resource IS REQUIRED. Cloud Monitoring rejects a
+              # workload.googleapis.com selector without it - that domain can
+              # attach to ~20 resource types and the endpoint will not guess.
+              # generic_task is what the googlecloud exporter writes for this
+              # deployment; verified live 2026-08-28.
+              query: |
+                sum(
+                  workload_googleapis_com:execution_active_count{
+                    monitored_resource="generic_task",
+                    execution_stage=~"queued|executing"
+                  }
+                )
+            authenticationRef:
+              name: gcp-auth
+
+        advanced:
+          horizontalPodAutoscalerConfig:
+            behavior:
+              scaleUp:
+                # Scale up immediately. There is already several minutes of
+                # unavoidable lag ahead of this point (Cloud Monitoring
+                # ingestion delay plus instance start), so adding a
+                # stabilization window here only makes builds slower.
+                stabilizationWindowSeconds: 0
+                policies:
+                  - type: Pods
+                    value: __MAX_WORKERS__
+                    periodSeconds: 30
+              scaleDown:
+                # Five minutes of quiet before shrinking. Belt and braces
+                # alongside counting executing actions: it also absorbs the
+                # gap between two waves of actions in one build, where the
+                # queue legitimately empties for a few seconds.
+                stabilizationWindowSeconds: 300
+                policies:
+                  - type: Pods
+                    value: 1
+                    periodSeconds: 60

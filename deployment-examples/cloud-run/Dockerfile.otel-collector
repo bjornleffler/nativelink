@@ -1,0 +1,15 @@
+# OTLP -> Cloud Monitoring bridge, deployed as a sidecar on the scheduler pool.
+#
+# The config is baked into the image rather than mounted, for the same reason
+# the NativeLink configs are (see Dockerfile.nativelink): "Secrets volume mount
+# is not supported for Worker Pools yet". It contains no secrets.
+#
+# PINNED DELIBERATELY. The collector's config schema changes between releases
+# and `latest` would let an upstream release break a deploy that changed
+# nothing. 0.159.0 is the current release as of 2026-08-28.
+ARG OTEL_COLLECTOR_VERSION=0.159.0
+FROM otel/opentelemetry-collector-contrib:${OTEL_COLLECTOR_VERSION}
+
+# The contrib image's default command already points at this path, so no CMD
+# override is needed and the Cloud Run container needs no --args.
+COPY otel/collector.yaml /etc/otelcol-contrib/config.yaml

@@ -36,6 +36,11 @@ DNS_DOMAIN="${DNS_DOMAIN:-nl.internal.}"
 CAS_DNS_NAME="${CAS_DNS_NAME:-nativelink-cas.${DNS_DOMAIN}}"
 SCHED_DNS_NAME="${SCHED_DNS_NAME:-nativelink-scheduler.${DNS_DOMAIN}}"
 SIDECAR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/dns-register:latest"
+# OTLP -> Cloud Monitoring bridge. Only the scheduler pool runs it: the queue
+# depth CREMA scales on lives there. Version must match cloudbuild.yaml's
+# _OTEL_COLLECTOR_VERSION.
+OTEL_COLLECTOR_VERSION="${OTEL_COLLECTOR_VERSION:-0.159.0}"
+OTEL_IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/otel-collector:${OTEL_COLLECTOR_VERSION}"
 
 CORE_SA="nativelink-core@${PROJECT}.iam.gserviceaccount.com"
 WORKER_SA="nativelink-worker@${PROJECT}.iam.gserviceaccount.com"
@@ -62,6 +67,25 @@ WORKER_CPU="${WORKER_CPU:-2}"
 WORKER_MEM="${WORKER_MEM:-4Gi}"
 WORKER_CACHE_BYTES="${WORKER_CACHE_BYTES:-500000000}" # 500MB of the 4Gi
 WORKER_COUNT="${WORKER_COUNT:-1}"
+
+# C++ worker pool. RECONSTRUCTED, NOT TRANSCRIBED: the live pool was deployed
+# by hand and no script owned it, so ./scale.sh could delete something nothing
+# could rebuild. Diff this against the live pool before relying on it:
+#   gcloud run worker-pools describe "${CC_WORKER_POOL}" --region="${REGION}"
+CC_WORKER_POOL="${CC_WORKER_POOL:-nativelink-worker-lre-cc}"
+CC_IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/worker-lre-cc:${NATIVELINK_VERSION}"
+CC_WORKER_CPU="${CC_WORKER_CPU:-${WORKER_CPU}}"
+CC_WORKER_MEM="${CC_WORKER_MEM:-${WORKER_MEM}}"
+CC_WORKER_COUNT="${CC_WORKER_COUNT:-1}"
+# TRANSCRIBED FROM THE LIVE POOL on 2026-08-28, not invented: this is the LRE
+# toolchain's Nix-derived identity and matches what Bazel sends as the
+# `container-image` exec_property. It is a `priority` property in
+# config/scheduler.json5, so a wrong value does not refuse work - it just
+# fails to prefer this pool, with no error anywhere. That is precisely why it
+# must be copied rather than guessed. It changes when the LRE toolchain does:
+#   gcloud run worker-pools describe "${CC_WORKER_POOL}" --region="${REGION}" \
+#     --format="value(spec.template.spec.containers[0].env)"
+CC_WORKER_PLATFORM="${CC_WORKER_PLATFORM:-docker://lre-cc:nz62ssm01zq2sq4768h58lnfalmpr7bz}"
 
 echo "==> project=${PROJECT} region=${REGION} version=${NATIVELINK_VERSION}"
 
@@ -120,7 +144,7 @@ fi
 # server can forward nl.internal queries to. Without this, clients across the
 # VPN resolve nativelink-core.nl.internal to nothing, even though the tunnel
 # itself is healthy.
-echo "==> [3c/7] Cloud DNS inbound forwarding (for clients across the VPN)"
+echo "==> [3c/8] Cloud DNS inbound forwarding (for clients across the VPN)"
 gcloud dns policies create "${DNS_INBOUND_POLICY}" \
   --networks="${VPC}" \
   --enable-inbound-forwarding \
@@ -138,17 +162,34 @@ gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
 gcloud projects add-iam-policy-binding "${PROJECT}" \
   --member="serviceAccount:${CORE_SA}" --role=roles/dns.admin \
   --condition=None >/dev/null
+# The OTel collector sidecar writes the scheduler's queue depth into Cloud
+# Monitoring, which is what CREMA autoscales on. Without this binding the
+# collector logs PermissionDenied on every export and the metric simply never
+# appears - which is indistinguishable from an idle farm, so the worker pool
+# would quietly never scale up. See AUTOSCALING.md.
+gcloud projects add-iam-policy-binding "${PROJECT}" \
+  --member="serviceAccount:${CORE_SA}" --role=roles/monitoring.metricWriter \
+  --condition=None >/dev/null
 
 echo "==> [5/8] Image (upstream + CA certificates - upstream ships none)"
 gcloud artifacts repositories create "${REPO}" --repository-format=docker \
   --location="${REGION}" --project="${PROJECT}" 2>/dev/null || echo "    repo exists"
 # Built in Cloud Build, not locally: pushing layers from a laptop proved
 # unreliable, and Cloud Build sits next to Artifact Registry.
-gcloud builds submit --config=cloudbuild.yaml \
-  --substitutions="_NATIVELINK_VERSION=${NATIVELINK_VERSION},_REGION=${REGION},_REPO=${REPO}" \
-  --project="${PROJECT}" .
+#
+# SKIP_BUILD=1 reuses whatever is already in Artifact Registry. ./scale.sh up
+# sets it: a teardown deletes pools and VMs but deliberately keeps the images,
+# so rebuilding them on every restore would add minutes and Cloud Build spend
+# for a byte-identical result.
+if [[ "${SKIP_BUILD:-}" == "1" ]]; then
+  echo "    SKIP_BUILD=1 - reusing the images in Artifact Registry"
+else
+  gcloud builds submit --config=cloudbuild.yaml \
+    --substitutions="_NATIVELINK_VERSION=${NATIVELINK_VERSION},_REGION=${REGION},_REPO=${REPO}" \
+    --project="${PROJECT}" .
+fi
 
-echo "==> [6/7] Deploying CAS and scheduler as separate pools"
+echo "==> [6/8] Deploying CAS and scheduler as separate pools"
 # Split deliberately: the scheduler holds queue state in memory and is pinned
 # to one instance. Sharing a pool made CAS inherit that cap and let blob
 # uploads compete with the one component coordinating the whole farm.
@@ -180,6 +221,14 @@ echo "    CAS at ${CAS_ADDR}:${CLIENT_PORT}"
 
 # --- Scheduler: no storage of its own; reads action protos from the CAS pool.
 # --- MUST stay at one instance - queue state lives in memory.
+#
+# The otel-collector sidecar exists so this pool's queue depth is visible to
+# CREMA (see AUTOSCALING.md). NativeLink needs no configuration to use it: the
+# OTLP metric exporter is built unconditionally and already defaults to
+# localhost:4317, so today those metrics are written into a socket nothing is
+# listening on. NOTE THE COST: it adds a third always-on container to a pool
+# that is pinned at one instance. Drop the sidecar and the deployment behaves
+# exactly as it did before, minus autoscaling.
 gcloud run worker-pools deploy "${SCHED_POOL}" \
   --project="${PROJECT}" \
   --region="${REGION}" --instances=1 \
@@ -193,18 +242,34 @@ gcloud run worker-pools deploy "${SCHED_POOL}" \
   --container=dns-register \
     --image="${SIDECAR_IMAGE}" \
     --cpu=1 --memory=512Mi \
-    --set-env-vars="DNS_ZONE=${DNS_ZONE},DNS_NAME=${SCHED_DNS_NAME},TTL=60"
+    --set-env-vars="DNS_ZONE=${DNS_ZONE},DNS_NAME=${SCHED_DNS_NAME},TTL=60" \
+  --container=otel-collector \
+    --image="${OTEL_IMAGE}" \
+    --cpu=1 --memory=512Mi
 
 SCHED_ADDR="${SCHED_DNS_NAME%.}"
 echo "    scheduler at ${SCHED_ADDR}:${CLIENT_PORT} (worker API :${WORKER_API_PORT})"
 
-echo "==> [7/7] Deploying worker fleet"
+echo "==> [7/8] Deploying worker fleet"
 gcloud run worker-pools deploy "${WORKER_POOL}" \
   --image="${IMAGE}" --region="${REGION}" --instances="${WORKER_COUNT}" \
   --cpu="${WORKER_CPU}" --memory="${WORKER_MEM}" \
   --service-account="${WORKER_SA}" \
   --network="${VPC}" --subnet="${WORKER_SUBNET}" \
   --set-env-vars="NL_CAS_ENDPOINT=${CAS_ADDR}:${CLIENT_PORT},NL_SCHEDULER_ENDPOINT=${SCHED_ADDR}:${WORKER_API_PORT},NL_WORKER_CPU_COUNT=${WORKER_CPU},NL_WORKER_CACHE_BYTES=${WORKER_CACHE_BYTES},NL_WORKER_PLATFORM=${NL_WORKER_PLATFORM:-undefined_platform}" \
+  --args="/etc/nativelink/worker.json5" \
+  --project="${PROJECT}"
+
+echo "==> [8/8] Deploying the C++ (LRE clang) worker fleet"
+# Same shape as the x86 pool above, different image: this one carries the
+# hermetic clang toolchain, so it is the pool that actually runs the C++
+# example. It is also the pool ./deploy-crema.sh autoscales.
+gcloud run worker-pools deploy "${CC_WORKER_POOL}" \
+  --image="${CC_IMAGE}" --region="${REGION}" --instances="${CC_WORKER_COUNT}" \
+  --cpu="${CC_WORKER_CPU}" --memory="${CC_WORKER_MEM}" \
+  --service-account="${WORKER_SA}" \
+  --network="${VPC}" --subnet="${WORKER_SUBNET}" \
+  --set-env-vars="NL_CAS_ENDPOINT=${CAS_ADDR}:${CLIENT_PORT},NL_SCHEDULER_ENDPOINT=${SCHED_ADDR}:${WORKER_API_PORT},NL_WORKER_CPU_COUNT=${CC_WORKER_CPU},NL_WORKER_CACHE_BYTES=${WORKER_CACHE_BYTES},NL_WORKER_PLATFORM=${CC_WORKER_PLATFORM}" \
   --args="/etc/nativelink/worker.json5" \
   --project="${PROJECT}"
 
