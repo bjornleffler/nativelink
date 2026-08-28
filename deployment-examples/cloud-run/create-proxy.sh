@@ -27,7 +27,12 @@ PROXY_VM="${PROXY_VM:-nl-proxy}"
 # WHO MAY CONNECT. Comma-separated CIDRs. Keep this list as small as possible;
 # it is the only thing standing between the internet and an unauthenticated
 # build cache that accepts writes.
-ALLOWED_IPS="${ALLOWED_IPS:-103.141.14.48/32}"   # router.leffler.org
+#
+# The default is a placeholder and will not match you - set ALLOWED_IPS to
+# your own egress address (curl ifconfig.me). Failing closed is deliberate:
+# the wrong default here opens a writable cache to strangers, so it errs
+# towards locking you out rather than letting anyone else in.
+ALLOWED_IPS="${ALLOWED_IPS:-1.2.3.4/32}"
 
 # Public ports on the proxy, forwarded to the internal pools.
 CAS_PUBLIC_PORT="${CAS_PUBLIC_PORT:-8980}"
